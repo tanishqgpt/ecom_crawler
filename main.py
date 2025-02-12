@@ -61,9 +61,7 @@ def main():
         domains = [
             "amazon.com",
             "flipkart.com",
-            "myntra.com",
-            "snapdeal.com",
-            "ajio.com"
+            "snapdeal.com"
         ]
 
     logger.info("Script started with domains: %s", domains)

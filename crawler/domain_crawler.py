@@ -5,6 +5,7 @@ import threading
 import aiohttp
 import os
 import json
+import re
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 from urllib.robotparser import RobotFileParser
@@ -16,26 +17,36 @@ class DomainCrawler:
     """
     Crawls a single domain, respecting robots.txt, picking a user agent,
     rate-limiting requests, handling 429 errors, and writing discovered product URLs
-    to JSON in real time. Now includes a thread lock for file writes.
+    to JSON only after the entire domain has been crawled (no real-time writes).
+
+    We still use a lock for thread-safety if multiple domains finish simultaneously.
     """
 
     # A static (class-level) lock shared by all instances of DomainCrawler
     _file_write_lock = threading.Lock()
 
     def __init__(self, domain: str):
+        """
+        :param domain: The exact domain string from main.py (e.g. "flipkart.com").
+        """
+        # 1) Keep the original domain as provided by main.py
+        self.original_domain = domain
+
+        # 2) Parse the domain for crawling logic (if domain is "http://flipkart.com", etc.)
         parsed = urlparse(domain)
         self.scheme = parsed.scheme or "http"
         if parsed.netloc:
-            self.base_netloc = parsed.netloc
+            self.netloc = parsed.netloc
         else:
-            self.base_netloc = parsed.path
+            # If user just provided "flipkart.com" without "http://"
+            # urlparse might store it in 'path'.
+            self.netloc = parsed.path
 
-        # We'll store just the domain as the key
-        self.domain = self.base_netloc
-        self.base_url = f"{self.scheme}://{self.base_netloc}"
+        self.base_url = f"{self.scheme}://{self.netloc}"
 
-        logger.info(f"[DomainCrawler] Initialized crawler for domain: {self.domain}")
+        logger.info(f"[DomainCrawler] Initialized crawler for domain: {self.original_domain}")
 
+        # For internal use
         self.visited_urls = set()
         self.product_urls = set()
         self.cache = {}
@@ -43,11 +54,22 @@ class DomainCrawler:
         self.effective_user_agent = None
 
     async def crawl(self):
-        logger.info(f"[DomainCrawler] Starting crawl for domain: {self.domain}")
+        """
+        Main entry point: 
+          - Load/parse robots.txt
+          - Recursively crawl from self.base_url
+          - Write all discovered product URLs to disk after finishing
+        """
+        logger.info(f"[DomainCrawler] Starting crawl for {self.original_domain}")
         await self._load_and_parse_robots_txt()
+
         async with aiohttp.ClientSession() as session:
             await self._crawl_url(self.base_url, depth=0, session=session)
-        logger.info(f"[DomainCrawler] Finished crawl for domain: {self.domain}")
+
+        logger.info(f"[DomainCrawler] Finished crawl for {self.original_domain}")
+
+        # After we've completed the entire domain crawl, write results once:
+        self._write_final_results()
 
     async def _crawl_url(self, url: str, depth: int, session: aiohttp.ClientSession):
         if url in self.visited_urls:
@@ -75,31 +97,34 @@ class DomainCrawler:
             absolute_url = urljoin(url, href)
             parsed_url = urlparse(absolute_url)
 
-            # Follow only within the same domain
-            if self.base_netloc not in parsed_url.netloc:
+            # Follow only within the same netloc
+            if self.netloc not in parsed_url.netloc:
                 logger.debug(f"[DomainCrawler] Skipping external link: {absolute_url}")
                 continue
 
-            # Check if it's a product URL
+            # Check product URL via regex
             if self._is_product_url(absolute_url):
                 logger.info(f"[DomainCrawler] Product URL found: {absolute_url}")
                 self.product_urls.add(absolute_url)
-                self._write_realtime_result(absolute_url)
 
             await self._crawl_url(absolute_url, depth + 1, session)
 
     async def _fetch(self, url: str, session: aiohttp.ClientSession) -> str:
+        """
+        Fetch with caching, random delay, 429 handling.
+        """
         if url in self.cache:
             logger.debug(f"[DomainCrawler] Cache hit: {url}")
             return self.cache[url]
 
-        # rate-limit: random delay
+        # Rate-limit: random delay
         delay = random.uniform(1, 2)
         logger.debug(f"[DomainCrawler] Sleeping {delay:.2f}s before request to {url}")
         await asyncio.sleep(delay)
 
         max_retries = 3
         attempt = 0
+
         while attempt < max_retries:
             attempt += 1
             try:
@@ -113,7 +138,7 @@ class DomainCrawler:
                         retry_after = response.headers.get("Retry-After", "5")
                         logger.warning(
                             f"[DomainCrawler] 429 at {url}; waiting {retry_after}s "
-                            f"before retry (attempt {attempt}/{max_retries})..."
+                            f"(attempt {attempt}/{max_retries})..."
                         )
                         await asyncio.sleep(int(retry_after))
                     else:
@@ -122,33 +147,49 @@ class DomainCrawler:
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 logger.error(f"[DomainCrawler] Error fetching {url} (attempt {attempt}/{max_retries}): {e}")
                 await asyncio.sleep(2)
+
         return ""
 
     def _is_product_url(self, url: str) -> bool:
+        """
+        Checks PRODUCT_PATTERNS (regex) against the full URL.
+        If any pattern matches, we consider it a product URL.
+        """
         for pattern in PRODUCT_PATTERNS:
-            if pattern in url:
+            if re.search(pattern, url):
+                logger.debug(f"[DomainCrawler] Regex match: pattern={pattern} in url={url}")
                 return True
         return False
 
     def get_product_urls(self) -> list:
+        """Return a sorted list of discovered product URLs."""
         return sorted(self.product_urls)
 
     def _can_fetch(self, url: str) -> bool:
+        """
+        Check robots.txt for self.effective_user_agent. 
+        If no user agent or parser data, default to allowing.
+        """
         if not self.effective_user_agent or not self.robot_parser.default_entry:
             return True
         return self.robot_parser.can_fetch(self.effective_user_agent, url)
 
     async def _load_and_parse_robots_txt(self):
-        robots_url = f"{self.scheme}://{self.base_netloc}/robots.txt"
+        """
+        Attempts to read robots.txt from domain. 
+        Then picks a user-agent from the file (defaulting to '*').
+        """
+        robots_url = f"{self.scheme}://{self.netloc}/robots.txt"
         logger.info(f"[DomainCrawler] Attempting to fetch robots.txt from {robots_url}")
 
         try:
             self.robot_parser.set_url(robots_url)
             self.robot_parser.read()
         except Exception as e:
-            logger.warning(f"[DomainCrawler] Failed to load robots.txt for {self.domain}: {e}")
+            logger.warning(f"[DomainCrawler] Failed to load robots.txt: {e}")
             return
 
+        # Optional: fetch raw text to pick user-agent from lines
         raw_robots = ""
         try:
             async with aiohttp.ClientSession() as session:
@@ -156,7 +197,7 @@ class DomainCrawler:
                     if resp.status == 200:
                         raw_robots = await resp.text()
         except Exception as e:
-            logger.warning(f"[DomainCrawler] Could not manually fetch robots.txt for {self.domain}: {e}")
+            logger.warning(f"[DomainCrawler] Could not manually fetch robots.txt for {self.original_domain}: {e}")
 
         chosen_agent = None
         potential_agents = []
@@ -168,7 +209,7 @@ class DomainCrawler:
                 agent_value = line.split(":", 1)[1].strip()
                 potential_agents.append(agent_value)
 
-        if any("*" == ua or ua.lower() == "*" for ua in potential_agents):
+        if any(ua.strip().lower() == "*" for ua in potential_agents):
             chosen_agent = "*"
         elif potential_agents:
             chosen_agent = potential_agents[0]
@@ -176,19 +217,15 @@ class DomainCrawler:
             chosen_agent = "*"
 
         self.effective_user_agent = chosen_agent
-        logger.info(
-            f"[DomainCrawler] Chose user-agent '{self.effective_user_agent}' based on {robots_url}"
-        )
+        logger.info(f"[DomainCrawler] Chose user-agent '{self.effective_user_agent}' based on {robots_url}")
 
-    def _write_realtime_result(self, product_url: str):
-        
+    def _write_final_results(self):
         """
-        Immediately update output.json whenever a new product is found.
-         a lock to prevent race conditions in a multi-thread scenario.
+        Write all discovered product URLs to OUTPUT_JSON once the domain crawl is done.
+        We lock around the file to avoid collisions if multiple domains finish at the same time.
         """
-        logger.info(f"[DomainCrawler] Updating {OUTPUT_JSON} with new product: {product_url}")
+        logger.info(f"[DomainCrawler] Writing final results for domain: {self.original_domain}")
 
-        # Acquire the class-level lock before reading/writing the file
         with self._file_write_lock:
             try:
                 # 1) Load existing JSON
@@ -198,17 +235,21 @@ class DomainCrawler:
                 else:
                     existing_data = {}
 
-                # 2) Append the product to this domain’s list
-                if self.domain not in existing_data:
-                    existing_data[self.domain] = []
+                # 2) Insert or update the key for this domain
+                if self.original_domain not in existing_data:
+                    existing_data[self.original_domain] = []
 
-                # Avoid duplicates
-                if product_url not in existing_data[self.domain]:
-                    existing_data[self.domain].append(product_url)
+                # Merge the newly found URLs with any existing ones
+                existing_set = set(existing_data[self.original_domain])
+                existing_set.update(self.product_urls)
+
+                # Convert back to a sorted list (optional)
+                updated_list = sorted(existing_set)
+                existing_data[self.original_domain] = updated_list
 
                 # 3) Write back
                 with open(OUTPUT_JSON, "w", encoding="utf-8") as f:
                     json.dump(existing_data, f, indent=4)
 
             except Exception as e:
-                logger.error(f"[DomainCrawler] Failed to write {product_url} to {OUTPUT_JSON}: {e}")
+                logger.error(f"[DomainCrawler] Failed to write final results to {OUTPUT_JSON}: {e}")

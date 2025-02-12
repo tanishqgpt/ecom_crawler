@@ -4,8 +4,11 @@ Adjust these to match your needs.
 """
 
 PRODUCT_PATTERNS = [
-    r'pd_rd_r',
-    r'iid=',
+    r'pd_rd_r', # pattern for amazon
+    r'iid=', #flipkart
+    r'[0-9]{6,10}/buy', #myntra 
+    r'product/[^/]+/[0-9]{7,}', #snapdeal 
+    r'/p/[0-9]{7,}' #ajio
 ]
 
 # Outfile 
