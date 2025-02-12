@@ -42,9 +42,5 @@ This repository provides a **modular**, **object-oriented**, and **configurable*
 - **Adjust Depth**  
   In `crawler/config.py`, modify `MAX_DEPTH` to control how many levels of internal links are visited.
 
-- **Handle Dynamic Websites**  
-  This solution fetches static HTML. For infinite scrolling or JavaScript-heavy sites, you might need to integrate a headless browser (e.g., Selenium or Playwright).  
-  1. Store the JavaScript-rendered HTML using a headless browser.  
-  2. Pass the HTML to the same parsing logic in `DomainCrawler`.
 
 
