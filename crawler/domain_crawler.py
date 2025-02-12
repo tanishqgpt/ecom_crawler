@@ -19,7 +19,7 @@ class DomainCrawler:
     rate-limiting requests, handling 429 errors, and writing discovered product URLs
     to JSON only after the entire domain has been crawled (no real-time writes).
 
-    We still use a lock for thread-safety if multiple domains finish simultaneously.
+    
     """
 
     # A static (class-level) lock shared by all instances of DomainCrawler
@@ -29,17 +29,16 @@ class DomainCrawler:
         """
         :param domain: The exact domain string from main.py (e.g. "flipkart.com").
         """
-        # 1) Keep the original domain as provided by main.py
+       
         self.original_domain = domain
 
-        # 2) Parse the domain for crawling logic (if domain is "http://flipkart.com", etc.)
+       
         parsed = urlparse(domain)
         self.scheme = parsed.scheme or "http"
         if parsed.netloc:
             self.netloc = parsed.netloc
         else:
-            # If user just provided "flipkart.com" without "http://"
-            # urlparse might store it in 'path'.
+            
             self.netloc = parsed.path
 
         self.base_url = f"{self.scheme}://{self.netloc}"
@@ -68,7 +67,7 @@ class DomainCrawler:
 
         logger.info(f"[DomainCrawler] Finished crawl for {self.original_domain}")
 
-        # After we've completed the entire domain crawl, write results once:
+        
         self._write_final_results()
 
     async def _crawl_url(self, url: str, depth: int, session: aiohttp.ClientSession):
@@ -117,7 +116,7 @@ class DomainCrawler:
             logger.debug(f"[DomainCrawler] Cache hit: {url}")
             return self.cache[url]
 
-        # Rate-limit: random delay
+       
         delay = random.uniform(1, 2)
         logger.debug(f"[DomainCrawler] Sleeping {delay:.2f}s before request to {url}")
         await asyncio.sleep(delay)
@@ -189,7 +188,6 @@ class DomainCrawler:
             logger.warning(f"[DomainCrawler] Failed to load robots.txt: {e}")
             return
 
-        # Optional: fetch raw text to pick user-agent from lines
         raw_robots = ""
         try:
             async with aiohttp.ClientSession() as session:
@@ -228,26 +226,21 @@ class DomainCrawler:
 
         with self._file_write_lock:
             try:
-                # 1) Load existing JSON
                 if os.path.isfile(OUTPUT_JSON):
                     with open(OUTPUT_JSON, "r", encoding="utf-8") as f:
                         existing_data = json.load(f)
                 else:
                     existing_data = {}
 
-                # 2) Insert or update the key for this domain
                 if self.original_domain not in existing_data:
                     existing_data[self.original_domain] = []
 
-                # Merge the newly found URLs with any existing ones
                 existing_set = set(existing_data[self.original_domain])
                 existing_set.update(self.product_urls)
 
-                # Convert back to a sorted list (optional)
                 updated_list = sorted(existing_set)
                 existing_data[self.original_domain] = updated_list
 
-                # 3) Write back
                 with open(OUTPUT_JSON, "w", encoding="utf-8") as f:
                     json.dump(existing_data, f, indent=4)
 
